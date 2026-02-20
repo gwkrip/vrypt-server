@@ -58,12 +58,12 @@ Download the latest binary for your platform from the [Releases](https://github.
 |---|---|
 | Linux x64 (glibc) | `vrypt-server-*-x86_64-unknown-linux-gnu.tar.gz` |
 | Linux x64 (musl / Alpine) | `vrypt-server-*-x86_64-unknown-linux-musl.tar.gz` |
-| Linux ARM64 | `vrypt-server-*-aarch64-unknown-linux-gnu.tar.gz` |
-| Linux ARMv7 | `vrypt-server-*-armv7-unknown-linux-gnueabihf.tar.gz` |
-| macOS Intel | `vrypt-server-*-x86_64-apple-darwin.tar.gz` |
-| macOS Apple Silicon | `vrypt-server-*-aarch64-apple-darwin.tar.gz` |
-| Windows x64 | `vrypt-server-*-x86_64-pc-windows-msvc.zip` |
-| FreeBSD x64 | `vrypt-server-*-x86_64-unknown-freebsd.tar.gz` |
+| Linux x86 (glibc) | `vrypt-server-*-i686-unknown-linux-gnu.tar.gz` |
+| Linux x86 (musl) | `vrypt-server-*-i686-unknown-linux-musl.tar.gz` |
+| Linux ARM64 (glibc) | `vrypt-server-*-aarch64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64 (musl) | `vrypt-server-*-aarch64-unknown-linux-musl.tar.gz` |
+| Linux ARMv7 (glibc) | `vrypt-server-*-armv7-unknown-linux-gnueabihf.tar.gz` |
+| Linux ARMv7 (musl) | `vrypt-server-*-armv7-unknown-linux-musleabihf.tar.gz` |
 
 ```bash
 # Linux / macOS
@@ -147,14 +147,14 @@ No async runtime. No HTTP framework. Just the essentials.
 
 ## Supported Targets
 
-19 pre-built binaries are published on every release:
+8 pre-built binaries are published on every release:
 
-| OS | Targets |
-|---|---|
-| Linux | `x86_64-gnu`, `x86_64-musl`, `i686-gnu`, `i686-musl`, `aarch64-gnu`, `aarch64-musl`, `armv7-gnueabihf`, `armv7-musleabihf`, `arm-gnueabihf`, `riscv64gc-gnu`, `powerpc64le-gnu`, `s390x-gnu` |
-| macOS | `x86_64-apple-darwin`, `aarch64-apple-darwin` |
-| Windows | `x86_64-msvc`, `i686-msvc`, `aarch64-msvc`, `x86_64-gnu` |
-| FreeBSD | `x86_64-unknown-freebsd` |
+| Arch | glibc | musl |
+|---|---|---|
+| x86_64  | `x86_64-unknown-linux-gnu`  | `x86_64-unknown-linux-musl`  |
+| i686    | `i686-unknown-linux-gnu`    | `i686-unknown-linux-musl`    |
+| aarch64 | `aarch64-unknown-linux-gnu` | `aarch64-unknown-linux-musl` |
+| armv7   | `armv7-unknown-linux-gnueabihf` | `armv7-unknown-linux-musleabihf` |
 
 ---
 
