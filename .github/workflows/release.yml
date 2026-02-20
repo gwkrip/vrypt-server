@@ -11,91 +11,26 @@ permissions:
 jobs:
   build:
     name: Build (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # ── Linux x86 ──────────────────────────────────────────────────────
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
             cross: false
-
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
             cross: true
-
           - target: i686-unknown-linux-gnu
-            os: ubuntu-latest
             cross: true
-
           - target: i686-unknown-linux-musl
-            os: ubuntu-latest
             cross: true
-
-          # ── Linux ARM ──────────────────────────────────────────────────────
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
             cross: true
-
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
             cross: true
-
           - target: armv7-unknown-linux-gnueabihf
-            os: ubuntu-latest
             cross: true
-
           - target: armv7-unknown-linux-musleabihf
-            os: ubuntu-latest
-            cross: true
-
-          - target: arm-unknown-linux-gnueabihf
-            os: ubuntu-latest
-            cross: true
-
-          # ── Linux RISC-V & others ──────────────────────────────────────────
-          - target: riscv64gc-unknown-linux-gnu
-            os: ubuntu-latest
-            cross: true
-
-          - target: powerpc64le-unknown-linux-gnu
-            os: ubuntu-latest
-            cross: true
-
-          - target: s390x-unknown-linux-gnu
-            os: ubuntu-latest
-            cross: true
-
-          # ── macOS ──────────────────────────────────────────────────────────
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            cross: false
-
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            cross: false
-
-          # ── Windows ────────────────────────────────────────────────────────
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            cross: false
-
-          - target: i686-pc-windows-msvc
-            os: windows-latest
-            cross: false
-
-          - target: aarch64-pc-windows-msvc
-            os: windows-latest
-            cross: false
-
-          - target: x86_64-pc-windows-gnu
-            os: windows-latest
-            cross: false
-
-          # ── FreeBSD ────────────────────────────────────────────────────────
-          - target: x86_64-unknown-freebsd
-            os: ubuntu-latest
             cross: true
 
     steps:
@@ -121,24 +56,12 @@ jobs:
         if: matrix.cross == true
         run: cross build --release --target ${{ matrix.target }}
 
-      # ── Package ─────────────────────────────────────────────────────────────
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
+      - name: Package
         run: |
           BIN=target/${{ matrix.target }}/release/vrypt-server
           ARCHIVE=vrypt-server-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
           tar -czf "$ARCHIVE" -C "$(dirname $BIN)" "$(basename $BIN)"
           echo "ASSET=$ARCHIVE" >> $GITHUB_ENV
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $bin = "target\${{ matrix.target }}\release\vrypt-server.exe"
-          $archive = "vrypt-server-${{ github.ref_name }}-${{ matrix.target }}.zip"
-          Compress-Archive -Path $bin -DestinationPath $archive
-          echo "ASSET=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -147,7 +70,6 @@ jobs:
           path: ${{ env.ASSET }}
           retention-days: 1
 
-  # ── Release ─────────────────────────────────────────────────────────────────
   release:
     name: Publish Release
     needs: build
@@ -163,7 +85,6 @@ jobs:
         run: |
           cd artifacts
           sha256sum * > checksums-sha256.txt
-          cat checksums-sha256.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -172,50 +93,25 @@ jobs:
           body: |
             ## Vrypt Server ${{ github.ref_name }}
 
-            High-performance HTTP server — responds `Vrypt` to all requests.
-
-            ### Installation
-
-            Download the binary for your platform, extract, and run:
+            ### Install
             ```bash
-            # Linux / macOS
             tar -xzf vrypt-server-*-<target>.tar.gz
-            ./vrypt-server               # default port 8080
-            ./vrypt-server --port 3000   # custom port
-
-            # Windows
-            # Extract zip, then:
-            .\vrypt-server.exe --port 3000
+            ./vrypt-server            # port 8080
+            ./vrypt-server -p 3000    # custom port
             ```
 
-            ### Verify checksum
+            ### Verify
             ```bash
             sha256sum -c checksums-sha256.txt
             ```
 
             ### Targets
-            | Platform | Target |
-            |---|---|
-            | Linux x64 (glibc) | `x86_64-unknown-linux-gnu` |
-            | Linux x64 (musl)  | `x86_64-unknown-linux-musl` |
-            | Linux x86 (glibc) | `i686-unknown-linux-gnu` |
-            | Linux x86 (musl)  | `i686-unknown-linux-musl` |
-            | Linux ARM64 (glibc) | `aarch64-unknown-linux-gnu` |
-            | Linux ARM64 (musl)  | `aarch64-unknown-linux-musl` |
-            | Linux ARMv7 (glibc) | `armv7-unknown-linux-gnueabihf` |
-            | Linux ARMv7 (musl)  | `armv7-unknown-linux-musleabihf` |
-            | Linux ARMv6         | `arm-unknown-linux-gnueabihf` |
-            | Linux RISC-V 64     | `riscv64gc-unknown-linux-gnu` |
-            | Linux POWER64LE     | `powerpc64le-unknown-linux-gnu` |
-            | Linux s390x         | `s390x-unknown-linux-gnu` |
-            | macOS x64           | `x86_64-apple-darwin` |
-            | macOS ARM64 (M1+)   | `aarch64-apple-darwin` |
-            | Windows x64 MSVC    | `x86_64-pc-windows-msvc` |
-            | Windows x86 MSVC    | `i686-pc-windows-msvc` |
-            | Windows ARM64 MSVC  | `aarch64-pc-windows-msvc` |
-            | Windows x64 GNU     | `x86_64-pc-windows-gnu` |
-            | FreeBSD x64         | `x86_64-unknown-freebsd` |
-          files: |
-            artifacts/*
+            | Arch | glibc | musl |
+            |---|---|---|
+            | x86_64  | ✓ | ✓ |
+            | i686    | ✓ | ✓ |
+            | aarch64 | ✓ | ✓ |
+            | armv7   | ✓ | ✓ |
+          files: artifacts/*
           fail_on_unmatched_files: true
           generate_release_notes: false
