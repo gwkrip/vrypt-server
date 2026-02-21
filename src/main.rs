@@ -15,29 +15,41 @@ const MAX_REQUEST_SIZE: usize = 64 * 1024;
 const RESPONSE_BODY: &[u8] = b"Vrypt";
 const MAX_CONNS: usize = 65536;
 const BUF_SIZE: usize = 64 * 1024;
-const POOL_CAPACITY: usize = MAX_CONNS;
+const MAX_RECYCLED_BUFS: usize = 256;
 
 struct BufPool {
     free: Vec<Box<[u8; BUF_SIZE]>>,
+    active: usize,
+    max_active: usize,
+    max_recycled: usize,
 }
 
 impl BufPool {
-    fn new(cap: usize) -> Self {
-        let mut free = Vec::with_capacity(cap);
-        for _ in 0..cap {
-            free.push(Box::new([0u8; BUF_SIZE]));
+    fn new(max_active: usize, max_recycled: usize) -> Self {
+        Self {
+            free: Vec::with_capacity(max_recycled),
+            active: 0,
+            max_active,
+            max_recycled,
         }
-        Self { free }
     }
 
     #[inline]
     fn acquire(&mut self) -> Option<Box<[u8; BUF_SIZE]>> {
-        self.free.pop()
+        if self.active >= self.max_active {
+            return None;
+        }
+        self.active += 1;
+        Some(self.free.pop().unwrap_or_else(|| Box::new([0u8; BUF_SIZE])))
     }
 
     #[inline]
-    fn release(&mut self, buf: Box<[u8; BUF_SIZE]>) {
-        self.free.push(buf);
+    fn release(&mut self, mut buf: Box<[u8; BUF_SIZE]>) {
+        self.active = self.active.saturating_sub(1);
+        if self.free.len() < self.max_recycled {
+            buf.fill(0);
+            self.free.push(buf);
+        }
     }
 }
 
@@ -48,7 +60,7 @@ struct TokenPool {
 
 impl TokenPool {
     fn new() -> Self {
-        Self { next: 1, free: Vec::new() }
+        Self { next: 1, free: Vec::with_capacity(MAX_CONNS) }
     }
 
     #[inline]
@@ -179,10 +191,10 @@ fn worker(addr: SocketAddr, response: &'static [u8]) {
     let mut poll = Poll::new().expect("poll::new");
     let mut events = Events::with_capacity(1024);
     let mut slab = Slab::new(MAX_CONNS);
-    let mut buf_pool = BufPool::new(POOL_CAPACITY);
+    let mut buf_pool = BufPool::new(MAX_CONNS, MAX_RECYCLED_BUFS);
     let mut token_pool = TokenPool::new();
-    let mut to_close: Vec<Token> = Vec::with_capacity(64);
-    let mut timed_out: Vec<Token> = Vec::with_capacity(64);
+    let mut to_close: Vec<Token> = Vec::with_capacity(MAX_CONNS);
+    let mut timed_out: Vec<Token> = Vec::with_capacity(MAX_CONNS);
 
     poll.registry()
         .register(&mut listener, SERVER_TOKEN, Interest::READABLE)
@@ -415,3 +427,4 @@ fn main() {
         }
     }
 }
+
