@@ -110,7 +110,13 @@ fn worker(addr: SocketAddr) {
         .expect("register listener");
 
     loop {
-        poll.poll(&mut events, Some(POLL_TIMEOUT)).expect("poll");
+        loop {
+            match poll.poll(&mut events, Some(POLL_TIMEOUT)) {
+                Ok(_) => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => panic!("poll: {e}"),
+            }
+        }
 
         let mut to_close: Vec<Token> = Vec::new();
 
