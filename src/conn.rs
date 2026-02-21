@@ -1,4 +1,4 @@
-use crate::config::{BUF_SIZE, CONN_TIMEOUT};
+use crate::config::BUF_SIZE;
 use std::time::Instant;
 
 pub struct Conn {
@@ -22,11 +22,6 @@ impl Conn {
             write_pos: None,
             last_active: Instant::now(),
         }
-    }
-
-    #[inline]
-    pub fn filled(&self) -> &[u8] {
-        &self.read_buf[..self.read_len]
     }
 
     #[inline]
@@ -61,10 +56,5 @@ impl Conn {
     #[inline]
     pub fn touch(&mut self) {
         self.last_active = Instant::now();
-    }
-
-    #[inline]
-    pub fn is_timed_out(&self) -> bool {
-        self.last_active.elapsed() > CONN_TIMEOUT
     }
 }
