@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 const SERVER_TOKEN: Token = Token(0);
 const DEFAULT_PORT: u16 = 8080;
 const CONN_TIMEOUT: Duration = Duration::from_secs(30);
-const POLL_TIMEOUT: Duration = Duration::from_secs(5);
+const POLL_TIMEOUT: Duration = Duration::from_millis(5000);
 const MAX_REQUEST_SIZE: usize = 64 * 1024;
 const RESPONSE_BODY: &[u8] = b"Vrypt";
 
@@ -54,18 +54,18 @@ impl TokenPool {
 struct Conn {
     stream: mio::net::TcpStream,
     read_buf: Vec<u8>,
-    write_buf: Vec<u8>,
+    write_buf: &'static [u8],
     write_pos: usize,
     last_active: Instant,
 }
 
 impl Conn {
-    fn new(stream: mio::net::TcpStream) -> Self {
+    fn new(stream: mio::net::TcpStream, response: &'static [u8]) -> Self {
         Self {
             stream,
             read_buf: Vec::with_capacity(1024),
-            write_buf: Vec::new(),
-            write_pos: 0,
+            write_buf: response,
+            write_pos: usize::MAX,
             last_active: Instant::now(),
         }
     }
@@ -78,6 +78,11 @@ impl Conn {
         self.write_pos < self.write_buf.len()
     }
 
+    fn arm_write(&mut self) {
+        self.read_buf.clear();
+        self.write_pos = 0;
+    }
+
     fn touch(&mut self) {
         self.last_active = Instant::now();
     }
@@ -87,9 +92,7 @@ impl Conn {
     }
 }
 
-fn worker(addr: SocketAddr) {
-    let response = build_response(RESPONSE_BODY);
-
+fn worker(addr: SocketAddr, response: &'static [u8]) {
     let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("socket::new");
     sock.set_reuse_address(true).expect("set_reuse_address");
     sock.set_reuse_port(true).expect("set_reuse_port");
@@ -105,6 +108,9 @@ fn worker(addr: SocketAddr) {
     let mut conns: HashMap<Token, Conn> = HashMap::new();
     let mut pool = TokenPool::new();
 
+    let mut to_close: Vec<Token> = Vec::new();
+    let mut timed_out: Vec<Token> = Vec::new();
+
     poll.registry()
         .register(&mut listener, SERVER_TOKEN, Interest::READABLE)
         .expect("register listener");
@@ -118,20 +124,33 @@ fn worker(addr: SocketAddr) {
             }
         }
 
-        let mut to_close: Vec<Token> = Vec::new();
+        to_close.clear();
 
         for event in events.iter() {
             match event.token() {
-                SERVER_TOKEN => accept_connections(&mut listener, &mut conns, &mut pool, &poll),
-                token => handle_connection(token, &mut conns, &poll, &response, &mut to_close),
+                SERVER_TOKEN => {
+                    accept_connections(&mut listener, &mut conns, &mut pool, &poll, response)
+                }
+                token => {
+                    handle_connection(token, &mut conns, &poll, &mut to_close)
+                }
             }
         }
 
-        for tok in to_close {
+        for tok in to_close.drain(..) {
             close_conn(&mut conns, &mut pool, &poll, tok);
         }
 
-        reap_timed_out(&mut conns, &mut pool, &poll);
+        timed_out.clear();
+        conns
+            .iter()
+            .filter(|(_, c)| c.is_timed_out())
+            .for_each(|(t, _)| timed_out.push(*t));
+
+        for tok in timed_out.drain(..) {
+            eprintln!("[info] timeout, closing {:?}", tok);
+            close_conn(&mut conns, &mut pool, &poll, tok);
+        }
     }
 }
 
@@ -140,14 +159,17 @@ fn accept_connections(
     conns: &mut HashMap<Token, Conn>,
     pool: &mut TokenPool,
     poll: &Poll,
+    response: &'static [u8],
 ) {
     loop {
         match listener.accept() {
             Ok((stream, _peer)) => {
                 let _ = stream.set_nodelay(true);
                 let tok = pool.acquire();
-                let mut conn = Conn::new(stream);
-                if let Err(e) = poll.registry().register(&mut conn.stream, tok, Interest::READABLE) {
+                let mut conn = Conn::new(stream, response);
+                if let Err(e) =
+                    poll.registry().register(&mut conn.stream, tok, Interest::READABLE)
+                {
                     eprintln!("[warn] register failed: {e}");
                     pool.release(tok);
                     continue;
@@ -167,7 +189,6 @@ fn handle_connection(
     token: Token,
     conns: &mut HashMap<Token, Conn>,
     poll: &Poll,
-    response: &[u8],
     to_close: &mut Vec<Token>,
 ) {
     let Some(conn) = conns.get_mut(&token) else { return };
@@ -177,10 +198,8 @@ fn handle_connection(
         return;
     }
 
-    if conn.request_complete() && conn.write_buf.is_empty() {
-        conn.read_buf.clear();
-        conn.write_buf = response.to_vec();
-        conn.write_pos = 0;
+    if conn.request_complete() && !conn.has_pending_write() {
+        conn.arm_write();
         let _ = poll.registry().reregister(
             &mut conn.stream,
             token,
@@ -242,19 +261,6 @@ fn do_write(conn: &mut Conn, token: Token, poll: &Poll, to_close: &mut Vec<Token
     }
 }
 
-fn reap_timed_out(conns: &mut HashMap<Token, Conn>, pool: &mut TokenPool, poll: &Poll) {
-    let timed_out: Vec<Token> = conns
-        .iter()
-        .filter(|(_, c)| c.is_timed_out())
-        .map(|(t, _)| *t)
-        .collect();
-
-    for tok in timed_out {
-        eprintln!("[info] timeout, closing {:?}", tok);
-        close_conn(conns, pool, poll, tok);
-    }
-}
-
 fn close_conn(conns: &mut HashMap<Token, Conn>, pool: &mut TokenPool, poll: &Poll, tok: Token) {
     if let Some(mut c) = conns.remove(&tok) {
         let _ = poll.registry().deregister(&mut c.stream);
@@ -286,10 +292,12 @@ fn main() {
     let addr = parse_args();
     let cpus = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
+    let response: &'static [u8] = Box::leak(build_response(RESPONSE_BODY).into_boxed_slice());
+
     println!("Vrypt listening on {addr} ({cpus} threads)");
 
     let handles: Vec<_> = (0..cpus)
-        .map(|_| thread::spawn(move || worker(addr)))
+        .map(|_| thread::spawn(move || worker(addr, response)))
         .collect();
 
     for h in handles {
