@@ -7,7 +7,9 @@ pub struct Slab {
 
 impl Slab {
     pub fn new(cap: usize) -> Self {
-        Self { slots: vec![None; cap] }
+        let mut slots = Vec::with_capacity(cap);
+        slots.resize_with(cap, || None);
+        Self { slots }
     }
 
     #[inline]
