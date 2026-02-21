@@ -14,11 +14,42 @@ Responds `Vrypt` to every method, every path, every time.
 
 ---
 
+## Table of Contents
+
+- [Overview](#overview)
+- [Features](#features)
+- [Architecture](#architecture)
+- [Project Structure](#project-structure)
+- [Memory Model](#memory-model)
+- [RPS Metrics](#rps-metrics)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Build Profiles](#build-profiles)
+- [Dependencies](#dependencies)
+- [Supported Targets](#supported-targets)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
 ## Overview
 
 Vrypt Server is a minimal, high-performance HTTP server with a single, deliberate purpose — respond with the plain text `Vrypt` to any incoming HTTP request, regardless of method or path.
 
 Built on a **multi-threaded epoll event loop** with `SO_REUSEPORT`, it handles tens of thousands of concurrent connections using only as many OS threads as there are CPU cores — no thread pools, no async runtimes, no unnecessary overhead.
+
+---
+
+## Features
+
+- **Zero-overhead response** — compile-time static byte slice, no heap allocation per request
+- **Multi-threaded epoll** — one thread per CPU core, fully saturating hardware parallelism
+- **`SO_REUSEPORT` kernel dispatch** — each thread owns its listener socket with zero accept contention
+- **Lazy buffer pool** — memory allocated on demand, recycled on close, ~0 MB at idle
+- **Sharded RPS counter** — per-thread atomic slots with cache-line padding, no false sharing
+- **Real-time StatsD metrics** — RPS pushed via UDP every second, fire-and-forget
+- **`TCP_NODELAY`** — Nagle's algorithm disabled for minimal latency
+- **HTTP Keep-Alive** — connection reuse to reduce TCP handshake overhead
 
 ---
 
@@ -34,31 +65,33 @@ Built on a **multi-threaded epoll event loop** with `SO_REUSEPORT`, it handles t
                     └──┬──────────┬──────────┬────────┘
                        │          │          │
                 ┌──────▼──┐ ┌─────▼───┐ ┌───▼─────┐
-                │Thread 0 │ │Thread 1 │ │Thread N │  (N = CPU cores)
+                │Thread 0 │ │Thread 1 │ │Thread N │  ← N = CPU cores
                 │  epoll  │ │  epoll  │ │  epoll  │
                 └────┬────┘ └────┬────┘ └────┬────┘
                      │           │            │
                 ┌────▼───────────▼────────────▼────┐
-                │     Sharded RPS Counter           │
+                │       Sharded RPS Counter         │
                 │  (per-thread, cache-line padded)  │
                 └────────────────┬─────────────────┘
                                  │  UDP push / 1s
                     ┌────────────▼────────────┐
-                    │   StatsD Collector       │
-                    │   127.0.0.1:8125         │
+                    │     StatsD Collector     │
+                    │     127.0.0.1:8125       │
                     └─────────────────────────┘
 ```
 
-| Design Decision | Benefit |
+### Design Decisions
+
+| Decision | Benefit |
 |---|---|
 | **One thread per CPU core** | Perfectly saturates hardware parallelism |
-| **SO_REUSEPORT** | Each thread owns its listener socket; the kernel load-balances accepts with zero contention |
+| **`SO_REUSEPORT`** | Each thread owns its listener socket; the kernel load-balances accepts with zero contention |
 | **Non-blocking I/O via epoll** (`mio`) | A single thread manages thousands of concurrent connections |
 | **Lazy buffer pool** | Memory allocated only when connections arrive, recycled on close — ~0 MB at idle |
 | **Sharded RPS counter** | Per-thread atomic slots with cache-line padding eliminate false sharing |
 | **UDP stats push** | RPS metrics sent to StatsD every second — fire-and-forget, zero blocking |
 | **Zero heap allocation per request** | Response is a compile-time static byte slice |
-| **TCP_NODELAY** | Nagle's algorithm disabled for minimal latency |
+| **`TCP_NODELAY`** | Nagle's algorithm disabled for minimal latency |
 | **Keep-alive support** | Connections are reused, reducing TCP handshake overhead |
 
 ---
@@ -84,11 +117,11 @@ vrypt/
 
 The buffer pool uses **lazy allocation with capped recycling**. No memory is pre-allocated at startup — buffers are created on demand and returned to a recycle list on connection close. When the recycle list is full, excess buffers are dropped and returned to the OS immediately.
 
-| State | Memory per worker |
+| State | Memory per Worker |
 |---|---|
 | Idle (0 connections) | ~0 MB |
 | 256 active connections | ~16 MB |
-| Full load (65 536 connections) | ~4 GB |
+| Full load (65,536 connections) | ~4 GB |
 
 ---
 
@@ -102,13 +135,13 @@ vrypt.rps:12345|g
 
 The counter uses **per-thread atomic slots** padded to 64 bytes (one cache line each), so worker threads never contend with each other when incrementing. A dedicated stats thread aggregates all slots and sends the UDP datagram — completely isolated from the hot path.
 
-To receive metrics locally for testing:
+**Listen for metrics locally (for testing):**
 
 ```bash
 nc -u -l 8125
 ```
 
-To change the target collector or push interval, edit `src/config.rs`:
+**Configure the target collector or push interval** in `src/config.rs`:
 
 ```rust
 pub const STATS_TARGET: &str = "127.0.0.1:8125";
@@ -234,7 +267,7 @@ Contributions, issues, and feature requests are welcome. Please open an issue fi
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feat/your-feature`)
-3. Commit your changes (`git commit -m 'feat: add your feature'`)
+3. Commit your changes using [Conventional Commits](https://www.conventionalcommits.org/) (`git commit -m 'feat: add your feature'`)
 4. Push to the branch (`git push origin feat/your-feature`)
 5. Open a Pull Request
 
@@ -243,3 +276,11 @@ Contributions, issues, and feature requests are welcome. Please open an issue fi
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
+
+---
+
+<div align="center">
+
+Made with ❤️ and Rust
+
+</div>
