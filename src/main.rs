@@ -2,8 +2,9 @@ use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io::{self, Read, Write};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,75 @@ const RESPONSE_BODY: &[u8] = b"Vrypt";
 const MAX_CONNS: usize = 65536;
 const BUF_SIZE: usize = 64 * 1024;
 const MAX_RECYCLED_BUFS: usize = 256;
+const STATS_INTERVAL: Duration = Duration::from_secs(1);
+const STATS_TARGET: &str = "127.0.0.1:8125";
+const STATS_METRIC: &str = "vrypt.rps";
+
+#[repr(align(64))]
+struct Slot {
+    count: AtomicU64,
+    _pad: [u8; 56],
+}
+
+struct RpsCounter {
+    slots: Box<[Slot]>,
+}
+
+impl RpsCounter {
+    fn new(num_threads: usize) -> &'static Self {
+        let slots = (0..num_threads)
+            .map(|_| Slot { count: AtomicU64::new(0), _pad: [0u8; 56] })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Box::leak(Box::new(Self { slots }))
+    }
+
+    #[inline]
+    fn increment(&self, thread_id: usize) {
+        self.slots[thread_id].count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn total(&self) -> u64 {
+        self.slots.iter().map(|s| s.count.load(Ordering::Relaxed)).sum()
+    }
+}
+
+fn spawn_stats_pusher(counter: &'static RpsCounter) {
+    thread::spawn(move || {
+        let sock = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[stats] failed to bind udp socket: {e}");
+                return;
+            }
+        };
+
+        let target: SocketAddr = match STATS_TARGET.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("[stats] invalid target address: {e}");
+                return;
+            }
+        };
+
+        let mut buf = [0u8; 64];
+        let mut prev: u64 = 0;
+
+        loop {
+            thread::sleep(STATS_INTERVAL);
+
+            let total = counter.total();
+            let rps = total.wrapping_sub(prev);
+            prev = total;
+
+            let msg = format!("{}:{}|g", STATS_METRIC, rps);
+            let bytes = msg.as_bytes();
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            let _ = sock.send_to(&buf[..n], target);
+        }
+    });
+}
 
 struct BufPool {
     free: Vec<Box<[u8; BUF_SIZE]>>,
@@ -177,7 +247,7 @@ fn build_response(body: &[u8]) -> Vec<u8> {
     res
 }
 
-fn worker(addr: SocketAddr, response: &'static [u8]) {
+fn worker(addr: SocketAddr, response: &'static [u8], counter: &'static RpsCounter, thread_id: usize) {
     let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("socket::new");
     sock.set_reuse_address(true).expect("set_reuse_address");
     sock.set_reuse_port(true).expect("set_reuse_port");
@@ -224,7 +294,7 @@ fn worker(addr: SocketAddr, response: &'static [u8]) {
                     );
                 }
                 token => {
-                    handle_connection(token, &mut slab, &poll, &mut to_close);
+                    handle_connection(token, &mut slab, &poll, &mut to_close, counter, thread_id);
                 }
             }
         }
@@ -301,6 +371,8 @@ fn handle_connection(
     slab: &mut Slab,
     poll: &Poll,
     to_close: &mut Vec<Token>,
+    counter: &'static RpsCounter,
+    thread_id: usize,
 ) {
     let Some(conn) = slab.get_mut(token) else { return };
     conn.touch();
@@ -319,7 +391,7 @@ fn handle_connection(
     }
 
     if conn.has_pending_write() {
-        do_write(conn, token, poll, to_close);
+        do_write(conn, token, poll, to_close, counter, thread_id);
     }
 }
 
@@ -354,13 +426,21 @@ fn do_read(conn: &mut Conn, token: Token, to_close: &mut Vec<Token>) -> bool {
     }
 }
 
-fn do_write(conn: &mut Conn, token: Token, poll: &Poll, to_close: &mut Vec<Token>) {
+fn do_write(
+    conn: &mut Conn,
+    token: Token,
+    poll: &Poll,
+    to_close: &mut Vec<Token>,
+    counter: &'static RpsCounter,
+    thread_id: usize,
+) {
     loop {
         let slice = &conn.write_buf[conn.write_pos..];
         match conn.stream.write(slice) {
             Ok(n) => {
                 conn.write_pos += n;
                 if !conn.has_pending_write() {
+                    counter.increment(thread_id);
                     let _ = poll
                         .registry()
                         .reregister(&mut conn.stream, token, Interest::READABLE);
@@ -414,11 +494,15 @@ fn main() {
     let addr = parse_args();
     let cpus = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let response: &'static [u8] = Box::leak(build_response(RESPONSE_BODY).into_boxed_slice());
+    let counter: &'static RpsCounter = RpsCounter::new(cpus);
+
+    spawn_stats_pusher(counter);
 
     println!("Vrypt listening on {addr} ({cpus} threads)");
+    println!("Stats pushing to {STATS_TARGET} every {}s", STATS_INTERVAL.as_secs());
 
     let handles: Vec<_> = (0..cpus)
-        .map(|_| thread::spawn(move || worker(addr, response)))
+        .map(|i| thread::spawn(move || worker(addr, response, counter, i)))
         .collect();
 
     for h in handles {
@@ -427,4 +511,3 @@ fn main() {
         }
     }
 }
-
