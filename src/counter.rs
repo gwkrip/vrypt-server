@@ -1,4 +1,5 @@
 use crate::config::{STATS_INTERVAL, STATS_METRIC, STATS_TARGET};
+use std::io::Write;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -60,10 +61,15 @@ pub fn spawn_stats_pusher(counter: &'static RpsCounter) {
             let rps = total.wrapping_sub(prev);
             prev = total;
 
-            let msg = format!("{}:{}|g", STATS_METRIC, rps);
-            let bytes = msg.as_bytes();
-            let n = bytes.len().min(buf.len());
-            buf[..n].copy_from_slice(&bytes[..n]);
+            let mut cursor = std::io::Cursor::new(&mut buf[..]);
+            if write!(cursor, "{}:{}|g", STATS_METRIC, rps).is_err() {
+                eprintln!(
+                    "[stats] message too long for buffer (metric='{}', rps={rps}); skipping",
+                    STATS_METRIC
+                );
+                continue;
+            }
+            let n = cursor.position() as usize;
             let _ = sock.send_to(&buf[..n], target);
         }
     });

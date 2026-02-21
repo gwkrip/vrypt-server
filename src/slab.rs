@@ -2,16 +2,12 @@ use crate::conn::Conn;
 use mio::Token;
 
 pub struct Slab {
-    pub slots: Vec<Option<Conn>>,
+    slots: Vec<Option<Conn>>,
 }
 
 impl Slab {
     pub fn new(cap: usize) -> Self {
-        let mut slots = Vec::with_capacity(cap);
-        for _ in 0..cap {
-            slots.push(None);
-        }
-        Self { slots }
+        Self { slots: vec![None; cap] }
     }
 
     #[inline]

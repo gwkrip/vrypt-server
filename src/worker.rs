@@ -6,8 +6,8 @@ use crate::slab::Slab;
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::BinaryHeap;
 use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::io::{FromRawFd, IntoRawFd};
@@ -17,6 +17,7 @@ use std::time::Instant;
 struct TimeoutEntry {
     deadline: Reverse<Instant>,
     token: Token,
+    generation: u64,
 }
 
 impl Ord for TimeoutEntry {
@@ -71,9 +72,12 @@ pub fn worker(addr: SocketAddr, response: &'static [u8], counter: &'static RpsCo
                 Some(entry) if entry.deadline.0 <= now => {
                     let entry = timeout_heap.pop().unwrap();
                     let tok = entry.token;
-                    if slab.get(tok).is_some() {
-                        eprintln!("[info] timeout, closing {:?}", tok);
-                        to_close.push(tok);
+                    match slab.get(tok) {
+                        Some(conn) if conn.generation == entry.generation => {
+                            eprintln!("[info] timeout, closing {:?}", tok);
+                            to_close.push(tok);
+                        }
+                        _ => {}
                     }
                 }
                 _ => break,
@@ -89,7 +93,7 @@ pub fn worker(addr: SocketAddr, response: &'static [u8], counter: &'static RpsCo
                     );
                 }
                 token => {
-                    handle_connection(token, &mut slab, &poll, &mut to_close, counter, thread_id);
+                    handle_connection(token, &mut slab, &poll, &mut to_close, counter, thread_id, &mut timeout_heap);
                 }
             }
         }
@@ -140,11 +144,13 @@ fn accept_connections(
                 }
 
                 let deadline = conn.last_active + CONN_TIMEOUT;
+                let generation = conn.generation;
                 slab.insert(tok, conn);
 
                 timeout_heap.push(TimeoutEntry {
                     deadline: Reverse(deadline),
                     token: tok,
+                    generation,
                 });
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -163,9 +169,18 @@ fn handle_connection(
     to_close: &mut Vec<Token>,
     counter: &'static RpsCounter,
     thread_id: usize,
+    timeout_heap: &mut BinaryHeap<TimeoutEntry>,
 ) {
     let Some(conn) = slab.get_mut(token) else { return };
+
     conn.touch();
+    let new_deadline = conn.last_active + CONN_TIMEOUT;
+    let new_generation = conn.generation;
+    timeout_heap.push(TimeoutEntry {
+        deadline: Reverse(new_deadline),
+        token,
+        generation: new_generation,
+    });
 
     if !conn.has_pending_write() {
         if !do_read(conn, token, to_close) {
@@ -189,7 +204,7 @@ fn handle_connection(
 fn do_read(conn: &mut Conn, token: Token, to_close: &mut Vec<Token>) -> bool {
     loop {
         if conn.read_len >= BUF_SIZE {
-            eprintln!("[warn] request too large, closing {:?}", token);
+            eprintln!("[warn] buffer full, closing {:?}", token);
             to_close.push(token);
             return false;
         }
@@ -202,7 +217,7 @@ fn do_read(conn: &mut Conn, token: Token, to_close: &mut Vec<Token>) -> bool {
             Ok(n) => {
                 conn.read_len += n;
                 if conn.read_len > MAX_REQUEST_SIZE {
-                    eprintln!("[warn] request too large, closing {:?}", token);
+                    eprintln!("[warn] request too large (>{} bytes), closing {:?}", MAX_REQUEST_SIZE, token);
                     to_close.push(token);
                     return false;
                 }

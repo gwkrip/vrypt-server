@@ -9,6 +9,7 @@ pub struct Conn {
     pub write_buf: &'static [u8],
     pub write_pos: Option<usize>,
     pub last_active: Instant,
+    pub generation: u64,
 }
 
 impl Conn {
@@ -21,6 +22,7 @@ impl Conn {
             write_buf: response,
             write_pos: None,
             last_active: Instant::now(),
+            generation: 0,
         }
     }
 
@@ -56,5 +58,6 @@ impl Conn {
     #[inline]
     pub fn touch(&mut self) {
         self.last_active = Instant::now();
+        self.generation = self.generation.wrapping_add(1);
     }
 }
