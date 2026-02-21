@@ -3,6 +3,7 @@ mod conn;
 mod counter;
 mod pool;
 mod slab;
+mod timer;
 mod worker;
 
 use config::{DEFAULT_PORT, RESPONSE_BODY, STATS_INTERVAL, STATS_TARGET};

@@ -3,34 +3,14 @@ use crate::conn::Conn;
 use crate::counter::RpsCounter;
 use crate::pool::{BufPool, TokenPool};
 use crate::slab::Slab;
+use crate::timer::TimerWheel;
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::time::Instant;
-
-#[derive(Eq, PartialEq)]
-struct TimeoutEntry {
-    deadline: Reverse<Instant>,
-    token: Token,
-    generation: u64,
-}
-
-impl Ord for TimeoutEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.deadline.cmp(&other.deadline)
-    }
-}
-
-impl PartialOrd for TimeoutEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
 
 pub fn worker(addr: SocketAddr, response: &'static [u8], counter: &'static RpsCounter, thread_id: usize) {
     let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("socket::new");
@@ -49,7 +29,8 @@ pub fn worker(addr: SocketAddr, response: &'static [u8], counter: &'static RpsCo
     let mut buf_pool = BufPool::new(MAX_CONNS, MAX_RECYCLED_BUFS);
     let mut token_pool = TokenPool::new();
     let mut to_close: Vec<Token> = Vec::with_capacity(64);
-    let mut timeout_heap: BinaryHeap<TimeoutEntry> = BinaryHeap::with_capacity(MAX_CONNS);
+    let mut wheel = TimerWheel::new(CONN_TIMEOUT);
+    let mut expired: Vec<(Token, u64)> = Vec::with_capacity(64);
 
     poll.registry()
         .register(&mut listener, SERVER_TOKEN, Interest::READABLE)
@@ -67,20 +48,14 @@ pub fn worker(addr: SocketAddr, response: &'static [u8], counter: &'static RpsCo
         to_close.clear();
         let now = Instant::now();
 
-        loop {
-            match timeout_heap.peek() {
-                Some(entry) if entry.deadline.0 <= now => {
-                    let entry = timeout_heap.pop().unwrap();
-                    let tok = entry.token;
-                    match slab.get(tok) {
-                        Some(conn) if conn.generation == entry.generation => {
-                            eprintln!("[info] timeout, closing {:?}", tok);
-                            to_close.push(tok);
-                        }
-                        _ => {}
-                    }
+        expired.clear();
+        wheel.advance(now, &mut expired);
+        for (tok, gen) in expired.drain(..) {
+            if let Some(conn) = slab.get(tok) {
+                if conn.generation == gen {
+                    eprintln!("[info] timeout, closing {:?}", tok);
+                    to_close.push(tok);
                 }
-                _ => break,
             }
         }
 
@@ -89,11 +64,11 @@ pub fn worker(addr: SocketAddr, response: &'static [u8], counter: &'static RpsCo
                 SERVER_TOKEN => {
                     accept_connections(
                         &mut listener, &mut slab, &mut token_pool,
-                        &mut buf_pool, &poll, response, &mut timeout_heap,
+                        &mut buf_pool, &poll, response, &mut wheel,
                     );
                 }
                 token => {
-                    handle_connection(token, &mut slab, &poll, &mut to_close, counter, thread_id, &mut timeout_heap);
+                    handle_connection(token, &mut slab, &poll, &mut to_close, counter, thread_id, &mut wheel);
                 }
             }
         }
@@ -111,7 +86,7 @@ fn accept_connections(
     buf_pool: &mut BufPool,
     poll: &Poll,
     response: &'static [u8],
-    timeout_heap: &mut BinaryHeap<TimeoutEntry>,
+    wheel: &mut TimerWheel,
 ) {
     loop {
         match listener.accept() {
@@ -143,15 +118,9 @@ fn accept_connections(
                     continue;
                 }
 
-                let deadline = conn.last_active + CONN_TIMEOUT;
                 let generation = conn.generation;
                 slab.insert(tok, conn);
-
-                timeout_heap.push(TimeoutEntry {
-                    deadline: Reverse(deadline),
-                    token: tok,
-                    generation,
-                });
+                wheel.add(tok, generation);
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) => {
@@ -169,18 +138,12 @@ fn handle_connection(
     to_close: &mut Vec<Token>,
     counter: &'static RpsCounter,
     thread_id: usize,
-    timeout_heap: &mut BinaryHeap<TimeoutEntry>,
+    wheel: &mut TimerWheel,
 ) {
     let Some(conn) = slab.get_mut(token) else { return };
 
     conn.touch();
-    let new_deadline = conn.last_active + CONN_TIMEOUT;
-    let new_generation = conn.generation;
-    timeout_heap.push(TimeoutEntry {
-        deadline: Reverse(new_deadline),
-        token,
-        generation: new_generation,
-    });
+    wheel.add(token, conn.generation);
 
     if !conn.has_pending_write() {
         if !do_read(conn, token, to_close) {
