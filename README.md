@@ -36,7 +36,17 @@ Built on a **multi-threaded epoll event loop** with `SO_REUSEPORT`, it handles t
                 ┌──────▼──┐ ┌─────▼───┐ ┌───▼─────┐
                 │Thread 0 │ │Thread 1 │ │Thread N │  (N = CPU cores)
                 │  epoll  │ │  epoll  │ │  epoll  │
-                └─────────┘ └─────────┘ └─────────┘
+                └────┬────┘ └────┬────┘ └────┬────┘
+                     │           │            │
+                ┌────▼───────────▼────────────▼────┐
+                │     Sharded RPS Counter           │
+                │  (per-thread, cache-line padded)  │
+                └────────────────┬─────────────────┘
+                                 │  UDP push / 1s
+                    ┌────────────▼────────────┐
+                    │   StatsD Collector       │
+                    │   127.0.0.1:8125         │
+                    └─────────────────────────┘
 ```
 
 | Design Decision | Benefit |
@@ -44,9 +54,66 @@ Built on a **multi-threaded epoll event loop** with `SO_REUSEPORT`, it handles t
 | **One thread per CPU core** | Perfectly saturates hardware parallelism |
 | **SO_REUSEPORT** | Each thread owns its listener socket; the kernel load-balances accepts with zero contention |
 | **Non-blocking I/O via epoll** (`mio`) | A single thread manages thousands of concurrent connections |
+| **Lazy buffer pool** | Memory allocated only when connections arrive, recycled on close — ~0 MB at idle |
+| **Sharded RPS counter** | Per-thread atomic slots with cache-line padding eliminate false sharing |
+| **UDP stats push** | RPS metrics sent to StatsD every second — fire-and-forget, zero blocking |
 | **Zero heap allocation per request** | Response is a compile-time static byte slice |
 | **TCP_NODELAY** | Nagle's algorithm disabled for minimal latency |
 | **Keep-alive support** | Connections are reused, reducing TCP handshake overhead |
+
+---
+
+## Project Structure
+
+```
+vrypt/
+├── Cargo.toml
+└── src/
+    ├── main.rs      — entry point, argument parsing, response builder
+    ├── config.rs    — all constants and tuning parameters
+    ├── conn.rs      — Conn struct and per-connection state
+    ├── counter.rs   — sharded RPS counter + UDP stats pusher
+    ├── pool.rs      — BufPool (lazy) and TokenPool
+    ├── slab.rs      — fixed-size connection slab allocator
+    └── worker.rs    — epoll event loop and I/O handlers
+```
+
+---
+
+## Memory Model
+
+The buffer pool uses **lazy allocation with capped recycling**. No memory is pre-allocated at startup — buffers are created on demand and returned to a recycle list on connection close. When the recycle list is full, excess buffers are dropped and returned to the OS immediately.
+
+| State | Memory per worker |
+|---|---|
+| Idle (0 connections) | ~0 MB |
+| 256 active connections | ~16 MB |
+| Full load (65 536 connections) | ~4 GB |
+
+---
+
+## RPS Metrics
+
+Vrypt pushes real-time request-per-second metrics via **UDP in StatsD gauge format** to `127.0.0.1:8125` every second.
+
+```
+vrypt.rps:12345|g
+```
+
+The counter uses **per-thread atomic slots** padded to 64 bytes (one cache line each), so worker threads never contend with each other when incrementing. A dedicated stats thread aggregates all slots and sends the UDP datagram — completely isolated from the hot path.
+
+To receive metrics locally for testing:
+
+```bash
+nc -u -l 8125
+```
+
+To change the target collector or push interval, edit `src/config.rs`:
+
+```rust
+pub const STATS_TARGET: &str = "127.0.0.1:8125";
+pub const STATS_INTERVAL: Duration = Duration::from_secs(1);
+```
 
 ---
 
@@ -122,15 +189,13 @@ curl -X DELETE http://localhost:8080/foo/bar/baz
 
 ## Build Profiles
 
-The release profile is tuned for maximum performance and minimum binary size:
+The release profile is tuned for maximum performance:
 
 ```toml
 [profile.release]
-opt-level     = 3       # Maximum compiler optimization
-lto           = "fat"   # Full link-time optimization across all crates
-codegen-units = 1       # Single codegen unit for best inlining
-panic         = "abort" # No unwinding overhead
-strip         = true    # Strip debug symbols for smallest binary
+opt-level     = 3        # Maximum compiler optimization
+lto           = "thin"   # Link-time optimization across crates
+codegen-units = 1        # Single codegen unit for best inlining
 ```
 
 ---
