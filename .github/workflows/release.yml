@@ -56,12 +56,12 @@ jobs:
         if: matrix.cross == true
         run: cross build --release --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Rename binary
         run: |
           BIN=target/${{ matrix.target }}/release/vrypt-server
-          ARCHIVE=vrypt-server-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
-          tar -czf "$ARCHIVE" -C "$(dirname $BIN)" "$(basename $BIN)"
-          echo "ASSET=$ARCHIVE" >> $GITHUB_ENV
+          DEST=vrypt-server-${{ github.ref_name }}-${{ matrix.target }}
+          cp "$BIN" "$DEST"
+          echo "ASSET=$DEST" >> $GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -95,9 +95,9 @@ jobs:
 
             ### Install
             ```bash
-            tar -xzf vrypt-server-*-<target>.tar.gz
-            ./vrypt-server            # port 8080
-            ./vrypt-server -p 3000    # custom port
+            chmod +x vrypt-server-*-<target>
+            ./vrypt-server-*-<target>
+            ./vrypt-server-*-<target> -p 3000
             ```
 
             ### Verify
