@@ -20,14 +20,17 @@ impl Slab {
     }
 
     #[inline]
+    pub fn get(&self, tok: Token) -> Option<&Conn> {
+        self.slots[tok.0].as_ref()
+    }
+
+    #[inline]
     pub fn get_mut(&mut self, tok: Token) -> Option<&mut Conn> {
         self.slots[tok.0].as_mut()
     }
 
-    pub fn iter_tokens(&self) -> impl Iterator<Item = Token> + '_ {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.as_ref().map(|_| Token(i)))
+    #[inline]
+    pub fn remove(&mut self, tok: Token) -> Option<Conn> {
+        self.slots[tok.0].take()
     }
 }

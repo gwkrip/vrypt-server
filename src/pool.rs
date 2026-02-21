@@ -28,10 +28,9 @@ impl BufPool {
     }
 
     #[inline]
-    pub fn release(&mut self, mut buf: Box<[u8; BUF_SIZE]>) {
+    pub fn release(&mut self, buf: Box<[u8; BUF_SIZE]>) {
         self.active = self.active.saturating_sub(1);
         if self.free.len() < self.max_recycled {
-            buf.fill(0);
             self.free.push(buf);
         }
     }

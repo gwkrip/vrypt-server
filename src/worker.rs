@@ -1,4 +1,4 @@
-use crate::config::{BUF_SIZE, MAX_CONNS, MAX_RECYCLED_BUFS, MAX_REQUEST_SIZE, POLL_TIMEOUT, SERVER_TOKEN};
+use crate::config::{BUF_SIZE, CONN_TIMEOUT, MAX_CONNS, MAX_RECYCLED_BUFS, MAX_REQUEST_SIZE, POLL_TIMEOUT, SERVER_TOKEN};
 use crate::conn::Conn;
 use crate::counter::RpsCounter;
 use crate::pool::{BufPool, TokenPool};
@@ -6,9 +6,30 @@ use crate::slab::Slab;
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::BinaryHeap;
+use std::cmp::Reverse;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::io::{FromRawFd, IntoRawFd};
+use std::time::Instant;
+
+#[derive(Eq, PartialEq)]
+struct TimeoutEntry {
+    deadline: Reverse<Instant>,
+    token: Token,
+}
+
+impl Ord for TimeoutEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.deadline.cmp(&other.deadline)
+    }
+}
+
+impl PartialOrd for TimeoutEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 pub fn worker(addr: SocketAddr, response: &'static [u8], counter: &'static RpsCounter, thread_id: usize) {
     let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("socket::new");
@@ -26,8 +47,8 @@ pub fn worker(addr: SocketAddr, response: &'static [u8], counter: &'static RpsCo
     let mut slab = Slab::new(MAX_CONNS);
     let mut buf_pool = BufPool::new(MAX_CONNS, MAX_RECYCLED_BUFS);
     let mut token_pool = TokenPool::new();
-    let mut to_close: Vec<Token> = Vec::with_capacity(MAX_CONNS);
-    let mut timed_out: Vec<Token> = Vec::with_capacity(MAX_CONNS);
+    let mut to_close: Vec<Token> = Vec::with_capacity(64);
+    let mut timeout_heap: BinaryHeap<TimeoutEntry> = BinaryHeap::with_capacity(MAX_CONNS);
 
     poll.registry()
         .register(&mut listener, SERVER_TOKEN, Interest::READABLE)
@@ -43,11 +64,29 @@ pub fn worker(addr: SocketAddr, response: &'static [u8], counter: &'static RpsCo
         }
 
         to_close.clear();
+        let now = Instant::now();
+
+        loop {
+            match timeout_heap.peek() {
+                Some(entry) if entry.deadline.0 <= now => {
+                    let entry = timeout_heap.pop().unwrap();
+                    let tok = entry.token;
+                    if slab.get(tok).is_some() {
+                        eprintln!("[info] timeout, closing {:?}", tok);
+                        to_close.push(tok);
+                    }
+                }
+                _ => break,
+            }
+        }
 
         for event in events.iter() {
             match event.token() {
                 SERVER_TOKEN => {
-                    accept_connections(&mut listener, &mut slab, &mut token_pool, &mut buf_pool, &poll, response);
+                    accept_connections(
+                        &mut listener, &mut slab, &mut token_pool,
+                        &mut buf_pool, &poll, response, &mut timeout_heap,
+                    );
                 }
                 token => {
                     handle_connection(token, &mut slab, &poll, &mut to_close, counter, thread_id);
@@ -56,18 +95,6 @@ pub fn worker(addr: SocketAddr, response: &'static [u8], counter: &'static RpsCo
         }
 
         for tok in to_close.drain(..) {
-            close_conn(&mut slab, &mut token_pool, &mut buf_pool, &poll, tok);
-        }
-
-        timed_out.clear();
-        for tok in slab.iter_tokens() {
-            if slab.slots[tok.0].as_ref().map_or(false, |c| c.is_timed_out()) {
-                timed_out.push(tok);
-            }
-        }
-
-        for tok in timed_out.drain(..) {
-            eprintln!("[info] timeout, closing {:?}", tok);
             close_conn(&mut slab, &mut token_pool, &mut buf_pool, &poll, tok);
         }
     }
@@ -80,6 +107,7 @@ fn accept_connections(
     buf_pool: &mut BufPool,
     poll: &Poll,
     response: &'static [u8],
+    timeout_heap: &mut BinaryHeap<TimeoutEntry>,
 ) {
     loop {
         match listener.accept() {
@@ -103,13 +131,21 @@ fn accept_connections(
                 };
 
                 let mut conn = Conn::new(stream, response, buf);
+
                 if let Err(e) = poll.registry().register(&mut conn.stream, tok, Interest::READABLE) {
                     eprintln!("[warn] register failed: {e}");
                     buf_pool.release(conn.read_buf);
                     token_pool.release(tok);
                     continue;
                 }
+
+                let deadline = conn.last_active + CONN_TIMEOUT;
                 slab.insert(tok, conn);
+
+                timeout_heap.push(TimeoutEntry {
+                    deadline: Reverse(deadline),
+                    token: tok,
+                });
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) => {
@@ -131,13 +167,18 @@ fn handle_connection(
     let Some(conn) = slab.get_mut(token) else { return };
     conn.touch();
 
-    if !do_read(conn, token, to_close) {
-        return;
-    }
+    if !conn.has_pending_write() {
+        if !do_read(conn, token, to_close) {
+            return;
+        }
 
-    if conn.request_complete() && !conn.has_pending_write() {
-        conn.arm_write();
-        let _ = poll.registry().reregister(&mut conn.stream, token, Interest::READABLE | Interest::WRITABLE);
+        if conn.request_complete() {
+            conn.arm_write();
+            let _ = poll.registry().reregister(
+                &mut conn.stream, token,
+                Interest::READABLE | Interest::WRITABLE,
+            );
+        }
     }
 
     if conn.has_pending_write() {
@@ -184,14 +225,24 @@ fn do_write(
     counter: &'static RpsCounter,
     thread_id: usize,
 ) {
+    let mut current_pos = match conn.write_pos {
+        Some(p) => p,
+        None => return,
+    };
+
     loop {
-        let slice = &conn.write_buf[conn.write_pos..];
+        let slice = &conn.write_buf[current_pos..];
         match conn.stream.write(slice) {
             Ok(n) => {
-                conn.write_pos += n;
+                current_pos += n;
+                conn.write_pos = Some(current_pos);
                 if !conn.has_pending_write() {
                     counter.increment(thread_id);
-                    let _ = poll.registry().reregister(&mut conn.stream, token, Interest::READABLE);
+                    conn.reset_for_read();
+                    let _ = poll.registry().reregister(
+                        &mut conn.stream, token,
+                        Interest::READABLE,
+                    );
                     break;
                 }
             }
@@ -212,7 +263,7 @@ fn close_conn(
     poll: &Poll,
     tok: Token,
 ) {
-    if let Some(mut c) = slab.slots[tok.0].take() {
+    if let Some(mut c) = slab.remove(tok) {
         let _ = poll.registry().deregister(&mut c.stream);
         buf_pool.release(c.read_buf);
         token_pool.release(tok);
